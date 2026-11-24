@@ -2,53 +2,129 @@ name: CI-Build
 
 on:
   push:
-      branches:
-        - master
-        - develop
+    branches: [master, develop]
   pull_request:
-      branches:
-        - master
-        - develop
+    branches: [master, develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   ci-build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
-      max-parallel: 5
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - macos-14
-          - macos-13
-          - windows-latest
-          
-    runs-on: ${{ matrix.os }}
+        include:
+          - os: ubuntu-24.04
+            target: linux-x86_64
+            executable: update_m32
+            add_data1: src/m32/*.bin:m32/
+            add_data2: src/m32pocket/*.bin:m32pocket/
+          - os: macos-15
+            target: macos-arm64
+            executable: update_m32
+            add_data1: src/m32/*.bin:m32/
+            add_data2: src/m32pocket/*.bin:m32pocket/
+          - os: macos-15-intel
+            target: macos-x86_64
+            executable: update_m32
+            add_data1: src/m32/*.bin:m32/
+            add_data2: src/m32pocket/*.bin:m32pocket/
+          - os: windows-2022
+            target: windows-x86_64
+            executable: update_m32.exe
+            add_data1: src/m32/*.bin;m32/
+            add_data2: src/m32pocket/*.bin;m32pocket/
+
+    defaults:
+      run:
+        # Login shells activate update-m32 on every platform, including Windows.
+        shell: bash -l {0}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
-      - name: Setup conda
+      - name: Set up declared Conda environment
         uses: conda-incubator/setup-miniconda@v3
         with:
-          miniforge-variant: Miniforge3
-          use-mamba: true
+          miniforge-version: latest
           environment-file: environment.yml
           activate-environment: update-m32
-          python-version: "3.10"
           auto-update-conda: false
           conda-remove-defaults: true
 
-      - name: Lint with flake8
-        shell: bash -l {0}
+      - name: Verify dependencies
         run: |
-          # stop the build if there are Python syntax errors or undefined names
-          flake8 src --count --select=E9,F63,F7,F82 --show-source --statistics
-          # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
-          flake8 src --count --max-complexity=10 --max-line-length=127 --statistics
-   
-      # Enable tests when we have some to run :-)
-      #- name: Test with pytest
-      #  shell: bash -l {0}
-      #  run: |
-      #    conda install pytest
-      #    pytest
+          python --version
+          python -m pip check
+          python -c "import esptool, serial, PyInstaller; from importlib.metadata import version; print({p: version(p) for p in ('pyserial', 'esptool', 'pyinstaller', 'flake8')})"
+
+      - name: Lint with flake8
+        run: |
+          python -m flake8 src --count --select=E9,F63,F7,F82 --show-source --statistics
+          python -m flake8 src --count --max-complexity=10 --max-line-length=127 --statistics
+
+      - name: Smoke-test source CLI
+        run: |
+          python src/update_m32.py --help
+          python src/update_m32.py --version
+
+      - name: Build standalone executable
+        run: |
+          python -m PyInstaller --clean -y --onefile \
+            --collect-all esptool \
+            --add-data "${{ matrix.add_data1 }}" \
+            --add-data "${{ matrix.add_data2 }}" \
+            src/update_m32.py
+
+      - name: Smoke-test bundled CLI
+        env:
+          EXECUTABLE: ${{ matrix.executable }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import subprocess
+
+          executable = Path('dist', os.environ['EXECUTABLE']).resolve()
+          if not executable.is_file():
+              raise SystemExit(f'Missing executable: {executable}')
+          for option in ('--help', '--version'):
+              subprocess.run([str(executable), option], check=True, timeout=60)
+          PY
+
+      - name: Archive executable
+        env:
+          TARGET: ${{ matrix.target }}
+          EXECUTABLE: ${{ matrix.executable }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from zipfile import ZIP_DEFLATED, ZipFile
+
+          Path('archive').mkdir(exist_ok=True)
+          executable = os.environ['EXECUTABLE']
+          archive = Path('archive', f"{os.environ['TARGET']}-update_m32.zip")
+          with ZipFile(archive, 'w', ZIP_DEFLATED) as bundle:
+              bundle.write(Path('dist', executable), arcname=executable)
+          PY
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}-update_m32
+          path: archive/${{ matrix.target }}-update_m32.zip
+          if-no-files-found: error
+          retention-days: 14
